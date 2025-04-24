@@ -1,0 +1,38 @@
+/* Facebook Post Image Downloader Styles */
+
+.fb-image-downloader-btn {
+  display: inline-flex;
+  align-items: center;
+  cursor: pointer;
+  padding: 6px 12px;
+  margin: 5px;
+  border-radius: 6px;
+  background-color: #3578e5;
+  color: white;
+  font-weight: bold;
+  transition: background-color 0.2s;
+}
+
+.fb-image-downloader-btn:hover {
+  background-color: #2d6bd2;
+}
+
+.fb-image-download-icon {
+  margin-right: 5px;
+  font-size: 16px;
+}
+
+.fb-image-download-text {
+  font-size: 14px;
+}
+
+/* Animation for when download starts */
+@keyframes download-pulse {
+  0% { transform: scale(1); }
+  50% { transform: scale(1.1); }
+  100% { transform: scale(1); }
+}
+
+.fb-image-downloader-btn.downloading {
+  animation: download-pulse 1s infinite;
+}
