@@ -2,9 +2,12 @@
 
 // Configuration
 const config = {
-  buttonClass: 'fb-image-downloader-btn',
   buttonText: 'Download Images',
+  buttonClass: 'fb-image-download-button',
   buttonPosition: 'afterbegin', // 'afterbegin' to prepend, 'beforeend' to append
+  minImageWidth: 100, // Minimum width to consider as a real image (to filter out icons)
+  minImageHeight: 100, // Minimum height to consider as a real image
+  maxImagesToProcess: 1000, // Maximum number of images to process in a post
   // Multiple post selectors to handle different Facebook layouts
   postSelectors: [
     // Standard Facebook article container
@@ -39,7 +42,6 @@ const config = {
     '.x1y1aw1k img'
   ],
   observerConfig: { childList: true, subtree: true }, // MutationObserver config
-  minImageWidth: 100, // Minimum width to consider an image for download (avoid icons)
 };
 
 // Debug helper function to find all potential posts
@@ -107,7 +109,7 @@ function addDownloadButtonToPost(post) {
     const potentialContentImages = Array.from(allImgTags).filter(img => {
       const width = img.naturalWidth || img.width || img.clientWidth || 0;
       const height = img.naturalHeight || img.height || img.clientHeight || 0;
-      return (width >= config.minImageWidth && height >= config.minImageWidth);
+      return (width >= config.minImageWidth && height >= config.minImageHeight);
     });
     
     imageCount = potentialContentImages.length;
@@ -259,6 +261,13 @@ function handleDownloadButtonClick(post) {
   
   // Process each image element to extract URLs
   uniqueImages.forEach(img => {
+    // Skip tiny images (likely emoticons or UI elements)
+    const width = img.naturalWidth || img.width || img.clientWidth || 0;
+    const height = img.naturalHeight || img.height || img.clientHeight || 0;
+    if (width < config.minImageWidth || height < config.minImageHeight) {
+      return; // Skip this image
+    }
+    
     // Check various attributes where image URLs might be found
     const src = img.src || img.currentSrc || '';
     const dataSrc = img.getAttribute('data-src') || '';
@@ -285,15 +294,36 @@ function handleDownloadButtonClick(post) {
       const srcsetParts = srcsetStr.split(',');
       let maxWidth = 0;
       
+      // Try to extract all URLs from srcset, not just the largest
+      const srcsetUrls = [];
+      
       srcsetParts.forEach(part => {
-        const [url, width] = part.trim().split(' ');
-        if (url && width) {
-          const numWidth = parseInt(width.replace('w', ''));
-          if (numWidth > maxWidth) {
-            maxWidth = numWidth;
-            largestFromSrcset = url;
+        try {
+          // Handle different srcset formats
+          // Format: "url width" or "url size"
+          const parts = part.trim().split(/\s+/);
+          if (parts.length >= 2 && parts[0]) {
+            const url = parts[0].trim();
+            srcsetUrls.push(url);
+            
+            // Also keep track of the largest
+            const descriptor = parts[1];
+            if (descriptor.includes('w')) {
+              const numWidth = parseInt(descriptor.replace('w', ''));
+              if (numWidth > maxWidth) {
+                maxWidth = numWidth;
+                largestFromSrcset = url;
+              }
+            }
           }
+        } catch (e) {
+          console.error('Error parsing srcset part:', part, e);
         }
+      });
+      
+      // Add all srcset URLs to our collection
+      srcsetUrls.forEach(url => {
+        if (url) imageUrls.push(url);
       });
     }
     
@@ -317,13 +347,45 @@ function handleDownloadButtonClick(post) {
     }
   });
   
-  // Also look for links that might point to full-size images
+  // Also look for links that might point to full-size images - more aggressively
+  // First look in all links
   const links = post.querySelectorAll('a');
   links.forEach(link => {
+    // Get both href and any data-attributes that might contain image URLs
     const href = link.href || link.getAttribute('href') || '';
-    if (href && (href.match(/\.(jpeg|jpg|png|gif|webp)(\?|$)/) || href.includes('fbcdn.net'))) {
+    const allAttrs = Array.from(link.attributes)
+      .filter(attr => attr.name.startsWith('data-') && attr.value.includes('http'))
+      .map(attr => attr.value);
+    
+    // Check if href points to an image or Facebook CDN
+    if (href && (href.match(/\.(jpeg|jpg|png|gif|webp)(\?|$)/) || 
+                 href.includes('fbcdn.net') || 
+                 href.includes('fbstatic') || 
+                 href.includes('fbsbx.com'))) {
       imageUrls.push(href);
     }
+    
+    // Add any data-attributes that look like image URLs
+    allAttrs.forEach(attr => {
+      if ((attr.match(/\.(jpeg|jpg|png|gif|webp)(\?|$)/) || 
+           attr.includes('fbcdn.net') || 
+           attr.includes('fbstatic') || 
+           attr.includes('fbsbx.com'))) {
+        imageUrls.push(attr);
+      }
+    });
+  });
+  
+  // Find all elements containing 'data-visualcompletion="media-vc-image"'
+  // This is a reliable marker for Facebook media images
+  const mediaElements = post.querySelectorAll('[data-visualcompletion="media-vc-image"]');
+  mediaElements.forEach(el => {
+    // Get all attributes that might contain image sources
+    Array.from(el.attributes)
+      .filter(attr => attr.value.includes('http'))
+      .forEach(attr => {
+        imageUrls.push(attr.value);
+      });
   });
   
   // Remove duplicates again
@@ -341,13 +403,41 @@ function handleDownloadButtonClick(post) {
     return;
   }
   
+  // If too many images, warn the user
+  if (imageUrls.length > 50) {
+    if (!confirm(`This post contains ${imageUrls.length} images. Do you want to download all of them?`)) {
+      if (clickedButton) {
+        clickedButton.style.backgroundColor = '#888';
+        clickedButton.innerText = 'Cancelled';
+        setTimeout(() => {
+          clickedButton.innerHTML = `
+            <span class="fb-image-download-icon">📥</span>
+            <span class="fb-image-download-text">${config.buttonText}</span>
+          `;
+          clickedButton.style.backgroundColor = '#3578e5';
+        }, 2000);
+      }
+      return;
+    }
+  }
+  
+  // Log how many images we found
+  console.log(`Sending ${imageUrls.length} images to download`);
+  
   // Send image URLs to background script for download
-  chrome.runtime.sendMessage({ 
-    action: 'downloadImages', 
-    images: imageUrls 
-  }, response => {
-    console.log('Background script response:', response);
-  });
+  // Split into batches if there are many images to avoid overwhelming the browser
+  const batchSize = 20;
+  for (let i = 0; i < imageUrls.length; i += batchSize) {
+    const batch = imageUrls.slice(i, i + batchSize);
+    chrome.runtime.sendMessage({ 
+      action: 'downloadImages', 
+      images: batch,
+      batchNumber: Math.floor(i / batchSize) + 1,
+      totalBatches: Math.ceil(imageUrls.length / batchSize)
+    }, response => {
+      console.log(`Batch ${Math.floor(i / batchSize) + 1} response:`, response);
+    });
+  }
   
   // Visual feedback
   if (clickedButton) {
