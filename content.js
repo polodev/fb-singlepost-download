@@ -1,5 +1,8 @@
 // Facebook Post Image Downloader - Content Script
 
+// Track if the extension is enabled (default to true)
+let extensionEnabled = true;
+
 // Configuration
 const config = {
   buttonText: 'Download Images',
@@ -28,18 +31,30 @@ const config = {
     // Facebook's main image classes
     'img.x1ey2m1c',
     'img.xz74otr',
-    // Images with visual completion attribute
+    // Images with visual completion attribute (these are reliable indicators of content images)
     'img[data-visualcompletion="media-vc-image"]',
+    '[data-visualcompletion="media-vc-image"]',
     // Other Facebook image classes
     'img.x5yr21d',
     'img.xt7dq6l',
     'img.xu3j5b3',
+    // Facebook media viewers and galleries
+    '.x193iq5w img', // Media viewer images
+    '.x1lliihq img', // Photo collections
+    '.xh8yej3 img', // Photo gallery 
+    '.x5yr21d img', // Carousel images
+    // Special containers for albums and multi-image posts
+    '[role="presentation"] img',
+    '[role="dialog"] img',
     // General image selectors for any post
     '.x78zum5 img', // Images inside main containers
     '.x1n2onr6 img', // Images inside standard layout containers
     // Media containers with large images
     '.x9f619 img',
-    '.x1y1aw1k img'
+    '.x1y1aw1k img',
+    // Very generic selectors as a last resort
+    'a > img', // Images inside links
+    '.x1rg5ohu img' // Another Facebook container class
   ],
   observerConfig: { childList: true, subtree: true }, // MutationObserver config
 };
@@ -59,21 +74,74 @@ function debugFindAllPotentialPosts() {
 function init() {
   console.log('Facebook Post Image Downloader Extension initialized');
   
-  // Run debug to see what we're finding (temporary)
-  debugFindAllPotentialPosts();
+  // Check if extension is enabled in storage
+  chrome.storage.sync.get(['enabled'], function(result) {
+    extensionEnabled = result.enabled !== undefined ? result.enabled : true;
+    console.log('Extension enabled state from storage:', extensionEnabled);
+    
+    if (extensionEnabled) {
+      // Run debug to see what we're finding (temporary)
+      debugFindAllPotentialPosts();
+      
+      // Add download buttons to existing posts
+      addDownloadButtonsToExistingPosts();
+      
+      // Set up observer to watch for new posts
+      setupPostObserver();
+      
+      // Add helpful console message for users
+      console.log('Facebook Image Downloader is ready. Look for Download Images buttons on posts.');
+    }
+  });
   
-  // Add download buttons to existing posts
-  addDownloadButtonsToExistingPosts();
+  // Listen for enable/disable messages from popup
+  chrome.runtime.onMessage.addListener(function(message, sender, sendResponse) {
+    if (message.action === 'toggleEnabled') {
+      extensionEnabled = message.enabled;
+      console.log('Extension ' + (extensionEnabled ? 'enabled' : 'disabled'));
+      
+      if (extensionEnabled) {
+        // Add buttons when enabled
+        addDownloadButtonsToExistingPosts();
+        setupPostObserver();
+      } else {
+        // Remove buttons when disabled
+        removeAllDownloadButtons();
+        disconnectObserver();
+      }
+      
+      sendResponse({success: true});
+    }
+    return true;
+  });
+}
+
+// Function to disconnect the observer
+function disconnectObserver() {
+  if (globalObserver) {
+    globalObserver.disconnect();
+    globalObserver = null;
+  }
   
-  // Set up observer to watch for new posts
-  setupPostObserver();
-  
-  // Add helpful console message for users
-  console.log('Facebook Image Downloader is ready. Look for Download Images buttons on posts.');
+  // Clear interval if it exists
+  if (window.downloadButtonsInterval) {
+    clearInterval(window.downloadButtonsInterval);
+    window.downloadButtonsInterval = null;
+  }
+}
+
+// Function to remove all download buttons
+function removeAllDownloadButtons() {
+  const buttons = document.querySelectorAll('.' + config.buttonClass);
+  buttons.forEach(button => button.remove());
+  console.log(`Removed ${buttons.length} download buttons`);
 }
 
 // Add download buttons to existing posts on the page
 function addDownloadButtonsToExistingPosts() {
+  // Only proceed if extension is enabled
+  if (!extensionEnabled) return;
+  
   // Try each post selector
   config.postSelectors.forEach(selector => {
     const posts = document.querySelectorAll(selector);
@@ -259,12 +327,54 @@ function handleDownloadButtonClick(post) {
   // Look for various image attributes
   let imageUrls = [];
   
+  // First look for all potential gallery containers
+  const galleryContainers = Array.from(post.querySelectorAll('.xh8yej3, [role="dialog"], .x193iq5w, [aria-label*="photo"]'));
+  console.log('Found gallery containers:', galleryContainers.length);
+  
+  // Process gallery containers specially
+  galleryContainers.forEach(container => {
+    // Find all images in this container
+    const galleryImages = container.querySelectorAll('img');
+    console.log(`Found ${galleryImages.length} images in gallery container`);
+    
+    // Get all direct URL attributes on images
+    galleryImages.forEach(img => {
+      // Don't filter by size in galleries - we want all images
+      const src = img.src || img.getAttribute('src') || '';
+      const dataSrc = img.getAttribute('data-src') || '';
+      const srcset = img.getAttribute('srcset') || '';
+      
+      if (src) {
+        // Try to get high-res version by URL manipulation
+        const highResSrc = src
+          .replace(/_(s|t)\.(jpg|png|webp)/i, '_n.$2') // Replace small/thumbnail markers
+          .replace(/\/p\d+x\d+\//i, '/p2048x2048/') // Increase resolution parameters
+          .replace(/\?size=\d+/i, '?size=2048'); // Increase size parameters
+        
+        imageUrls.push(highResSrc);
+      }
+      
+      if (dataSrc && dataSrc !== src) imageUrls.push(dataSrc);
+      
+      // Extract all urls from srcset
+      if (srcset) {
+        srcset.split(',').forEach(part => {
+          const srcUrl = part.trim().split(/\s+/)[0];
+          if (srcUrl) imageUrls.push(srcUrl);
+        });
+      }
+    });
+  });
+  
   // Process each image element to extract URLs
   uniqueImages.forEach(img => {
-    // Skip tiny images (likely emoticons or UI elements)
+    // Check if this image is in a gallery container
+    const inGallery = img.closest('.xh8yej3') || img.closest('[role="dialog"]') || img.closest('.x193iq5w');
+    
+    // Skip tiny images (likely emoticons or UI elements) unless they're in a gallery
     const width = img.naturalWidth || img.width || img.clientWidth || 0;
     const height = img.naturalHeight || img.height || img.clientHeight || 0;
-    if (width < config.minImageWidth || height < config.minImageHeight) {
+    if (!inGallery && width < config.minImageWidth && height < config.minImageHeight) {
       return; // Skip this image
     }
     
@@ -357,6 +467,50 @@ function handleDownloadButtonClick(post) {
       .filter(attr => attr.name.startsWith('data-') && attr.value.includes('http'))
       .map(attr => attr.value);
     
+    // Special handling for links to Facebook photos
+    if (href && (href.includes('/photos/') || href.includes('/photo.php'))) {
+      console.log('Found link to Facebook photo:', href);
+      // These links often contain gallery images
+      
+      // Look for image inside the link
+      const imgInLink = link.querySelector('img');
+      if (imgInLink) {
+        const src = imgInLink.src || imgInLink.getAttribute('src') || '';
+        if (src) {
+          // Try to get high-res version by URL manipulation
+          const highResSrc = src
+            .replace(/_(s|t)\.(jpg|png|webp)/i, '_n.$2') // Replace small/thumbnail markers
+            .replace(/\/p\d+x\d+\//i, '/p2048x2048/') // Increase resolution parameters
+            .replace(/\?size=\d+/i, '?size=2048'); // Increase size parameters
+          
+          imageUrls.push(highResSrc);
+        }
+      }
+      
+      // Look for parent containers that might have more images
+      let parent = link.parentElement;
+      while (parent && parent !== post) {
+        const containerImages = parent.querySelectorAll('img');
+        if (containerImages.length > 1) {
+          console.log(`Found container with ${containerImages.length} images related to photo link`);
+          containerImages.forEach(img => {
+            const src = img.src || img.getAttribute('src') || '';
+            if (src) {
+              // Try to get high-res version
+              const highResSrc = src
+                .replace(/_(s|t)\.(jpg|png|webp)/i, '_n.$2')
+                .replace(/\/p\d+x\d+\//i, '/p2048x2048/')
+                .replace(/\?size=\d+/i, '?size=2048');
+              
+              imageUrls.push(highResSrc);
+            }
+          });
+          break;
+        }
+        parent = parent.parentElement;
+      }
+    }
+    
     // Check if href points to an image or Facebook CDN
     if (href && (href.match(/\.(jpeg|jpg|png|gif|webp)(\?|$)/) || 
                  href.includes('fbcdn.net') || 
@@ -379,13 +533,73 @@ function handleDownloadButtonClick(post) {
   // Find all elements containing 'data-visualcompletion="media-vc-image"'
   // This is a reliable marker for Facebook media images
   const mediaElements = post.querySelectorAll('[data-visualcompletion="media-vc-image"]');
+  console.log('Found media-vc-image elements:', mediaElements.length);
+  
   mediaElements.forEach(el => {
     // Get all attributes that might contain image sources
     Array.from(el.attributes)
-      .filter(attr => attr.value.includes('http'))
+      .filter(attr => attr.value && attr.value.includes && attr.value.includes('http'))
       .forEach(attr => {
+        console.log('Found image URL in attribute:', attr.name, attr.value);
         imageUrls.push(attr.value);
       });
+      
+    // Look for parent elements that might be part of a gallery
+    let parent = el.parentElement;
+    let foundGalleryContainer = false;
+    
+    // Try to find a parent container that might hold gallery navigation
+    // (often up to 3-5 levels up from the media element)
+    for (let i = 0; i < 5 && parent && !foundGalleryContainer; i++) {
+      // Look for gallery navigation indicators (arrows, dots, etc.)
+      const navigationElements = parent.querySelectorAll('[aria-label*="next"], [aria-label*="previous"], [role="button"][tabindex="0"]');
+      
+      if (navigationElements.length > 0) {
+        console.log('Found potential gallery navigation elements:', navigationElements.length);
+        foundGalleryContainer = true;
+        
+        // Look for any numeric indicators that might show total images in gallery
+        const textElements = Array.from(parent.querySelectorAll('*')).filter(el => {
+          const text = el.textContent && el.textContent.trim();
+          return text && text.match(/\d+\s*\/\s*\d+/); // Pattern like "1 / 76"
+        });
+        
+        if (textElements.length > 0) {
+          const countMatch = textElements[0].textContent.trim().match(/\d+\s*\/\s*(\d+)/);
+          if (countMatch && countMatch[1]) {
+            const totalImages = parseInt(countMatch[1]);
+            console.log(`Found gallery counter: ${textElements[0].textContent}, indicating ${totalImages} total images`);
+            
+            // If we have a high-res source for this image, try to extract a pattern for other images
+            const currentSrc = el.src || el.getAttribute('src') || '';
+            if (currentSrc && totalImages > 1) {
+              // Many Facebook galleries use numbered URLs for sequential images
+              // Try to derive a pattern from the current URL
+              
+              // Look for patterns like: image_123.jpg, where 123 might be replaceable with other numbers
+              const numberMatch = currentSrc.match(/[_-](\d+)\.(jpe?g|png|webp|gif)/i);
+              if (numberMatch) {
+                const prefix = currentSrc.substring(0, numberMatch.index);
+                const suffix = currentSrc.substring(numberMatch.index + numberMatch[0].length);
+                const numDigits = numberMatch[1].length;
+                const currentNum = parseInt(numberMatch[1]);
+                
+                // Generate URLs for other images in the sequence
+                for (let num = 1; num <= totalImages; num++) {
+                  if (num !== currentNum) {
+                    const paddedNum = num.toString().padStart(numDigits, '0');
+                    const constructedUrl = `${prefix}${paddedNum}${suffix}`;
+                    console.log(`Constructed URL for image ${num}: ${constructedUrl}`);
+                    imageUrls.push(constructedUrl);
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+      parent = parent.parentElement;
+    }
   });
   
   // Remove duplicates again
@@ -424,11 +638,35 @@ function handleDownloadButtonClick(post) {
   // Log how many images we found
   console.log(`Sending ${imageUrls.length} images to download`);
   
+  // Log what we found
+  console.log(`Found total of ${imageUrls.length} image URLs before filtering duplicates`);
+  
+  // Remove duplicates again
+  imageUrls = [...new Set(imageUrls)];
+  console.log(`After removing duplicates: ${imageUrls.length} unique image URLs`);
+  
+  // Further filter to remove small or irrelevant images
+  imageUrls = imageUrls.filter(url => {
+    // Skip emoji and reaction images
+    if (url.includes('emoji.php') || url.includes('reaction/image')) {
+      return false;
+    }
+    
+    // Skip small icon images (often used for UI)
+    if (url.includes('icon') && url.includes('16x16')) {
+      return false;
+    }
+    
+    return true;
+  });
+  
   // Send image URLs to background script for download
   // Split into batches if there are many images to avoid overwhelming the browser
   const batchSize = 20;
   for (let i = 0; i < imageUrls.length; i += batchSize) {
     const batch = imageUrls.slice(i, i + batchSize);
+    console.log(`Sending batch ${Math.floor(i / batchSize) + 1} with ${batch.length} images...`);
+    
     chrome.runtime.sendMessage({ 
       action: 'downloadImages', 
       images: batch,
@@ -455,8 +693,14 @@ function handleDownloadButtonClick(post) {
   }
 }
 
+// Global observer reference so we can disconnect it later
+let globalObserver = null;
+
 // Set up MutationObserver to watch for new posts
 function setupPostObserver() {
+  // Only set up if not already observing
+  if (globalObserver) return;
+  
   // Keep track of nodes we've already processed to prevent duplicates
   const processedNodes = new WeakSet();
   
@@ -492,10 +736,17 @@ function setupPostObserver() {
   // Start observing the entire document
   observer.observe(document.body, config.observerConfig);
   
+  // Save reference to observer
+  globalObserver = observer;
+  
   // Also run a check every few seconds for posts that might have been missed
-  setInterval(() => {
-    addDownloadButtonsToExistingPosts();
-  }, 3000);
+  if (!window.downloadButtonsInterval) {
+    window.downloadButtonsInterval = setInterval(() => {
+      if (extensionEnabled) {
+        addDownloadButtonsToExistingPosts();
+      }
+    }, 3000);
+  }
 }
 
 // Initialize when the DOM is fully loaded

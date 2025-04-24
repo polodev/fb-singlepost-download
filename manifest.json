@@ -3,7 +3,7 @@
   "name": "Facebook Post Image Downloader",
   "version": "1.0",
   "description": "Adds a download button to Facebook posts to download all images",
-  "permissions": ["activeTab", "downloads", "scripting"],
+  "permissions": ["activeTab", "downloads", "scripting", "storage"],
   "icons": {
     "16": "icons/icon16.png",
     "48": "icons/icon48.png",
